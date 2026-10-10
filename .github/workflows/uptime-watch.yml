@@ -8,7 +8,12 @@ name: AEVO uptime
 on:
   schedule:
     - cron: '*/5 * * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      test:
+        description: 'Пробная тревога: прислать письмо, что сторож работает'
+        type: boolean
+        default: false
 permissions:
   contents: read
   actions: write
@@ -52,6 +57,10 @@ jobs:
             [ "$C" = 200 ] || { echo "::error::Resend $C: $(head -c 200 mail.out)"; return 1; }
           }
           RC=0
+          if [ "${{ inputs.test }}" = "true" ]; then
+            mail "🧪 Пробная тревога AEVO (внешний сторож GitHub)" "Это проверка: сторож вне Яндекса работает, письма доходят. Сейчас: сайт $S, сервер /api/health $A$([ -n "$WHY" ] && echo " — есть провал: $WHY"). Настоящая тревога приходит после двух провалов подряд (≈10 минут)." || RC=1
+            exit $RC
+          fi
           if [ -n "$WHY" ]; then
             FAILS=$((FAILS+1)); [ "$SINCE" = 0 ] && SINCE=$NOW
             echo "провал $FAILS подряд: $WHY"

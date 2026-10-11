@@ -1,19 +1,29 @@
 # Второй сторож AEVO — ВНЕ Яндекса (10.10.2026, решение Зураба после 08.10, когда сторож-функция в Яндексе час лежала вместе с облаком).
-# Каждые 5 минут: https://aevoanimals.com (сайт) и https://aevoanimals.com/api/health (сервер через общий вход + база).
+# Проверяет https://aevoanimals.com (сайт) и https://aevoanimals.com/api/health (сервер через общий вход + база) каждые 4 минуты.
 # 2 провала подряд → письмо владельцу (Resend — тот же отправитель, что у монитора; новых регистраций нет); починилось → «🟢».
 # Письмо не ушло (нет ключа / Resend лежит) → шаг падает, и GitHub сам шлёт письмо о сбое владельцу аккаунта (запасной путь).
 # Секреты репозитория: RESEND_API_KEY, ALERT_TO. Состояние между запусками — кэш Actions (счётчик провалов, «тревога уже ушла»).
-# ⚠️ Расписание GitHub не точное: запуски бывают с опозданием на минуты, в часы пик — пропуски. Это страховка, а не секундомер.
+#
+# Авария 11.10 (зона ru-central1-a Яндекса без питания, docs/handoff/outage-2026-10-11.md) — сторож молчал по двум причинам, обе здесь исправлены:
+#  1) когда сервер не отвечает СОВСЕМ, файла api.json нет → `head` внутри присваивания WHY падал → `bash -e` обрывал шаг ДО письма.
+#     Теперь шаг без `-e`, а каждая проверка устойчива к пустому ответу.
+#  2) расписание GitHub «*/5» за 20 часов сработало 3 раза (GitHub не гарантирует запуски по расписанию). Теперь ОДИН запуск
+#     сам крутит проверки каждые 4 минуты ~5,5 часа, а расписание каждые 15 минут лишь «подхватывает» следующий: в очереди
+#     concurrency ждёт один, остальные GitHub отменяет. Пропусков расписания хватает с запасом: нужен хотя бы один запуск за 5,5 часа.
+#     Репозиторий публичный — минуты Actions бесплатны без предела.
 name: AEVO uptime
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       test:
         description: 'Пробная тревога: прислать письмо, что сторож работает'
         type: boolean
         default: false
+      minutes:
+        description: 'Сколько минут крутить проверки (по умолчанию 330)'
+        default: '330'
 permissions:
   contents: read
   actions: write
@@ -23,7 +33,7 @@ concurrency:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 350
     steps:
       - name: Состояние прошлого запуска
         uses: actions/cache/restore@v4
@@ -31,58 +41,75 @@ jobs:
           path: state
           key: uptime-state-${{ github.run_id }}
           restore-keys: uptime-state-
-      - name: Проверка
+      - name: Проверки каждые 4 минуты
+        shell: bash {0}
         env:
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           ALERT_TO: ${{ secrets.ALERT_TO }}
+          TEST: ${{ inputs.test }}
+          MINUTES: ${{ inputs.minutes || '330' }}
         run: |
-          set -u
           mkdir -p state
           FAILS=$(cat state/fails 2>/dev/null || echo 0); ALERTED=$(cat state/alerted 2>/dev/null || echo 0); SINCE=$(cat state/since 2>/dev/null || echo 0)
-          NOW=$(date -u +%s); WHY=""
-          # Сайт: 200 и страница приложения. Сервер: 200 и {"ok":true} (база ответила).
-          for i in 1 2; do
-            S=$(curl -s -o site.html -w '%{http_code}' --max-time 20 https://aevoanimals.com/ || echo 000)
-            A=$(curl -s -o api.json -w '%{http_code}' --max-time 20 https://aevoanimals.com/api/health || echo 000)
-            WHY=""
-            [ "$S" = 200 ] && grep -qi '<div id="root"\|AEVO' site.html || WHY="сайт: $S"
-            [ "$A" = 200 ] && grep -q '"ok":true' api.json || WHY="${WHY:+$WHY; }сервер /api/health: $A $(head -c 120 api.json 2>/dev/null)"
-            [ -z "$WHY" ] && break
-            sleep 15
-          done
+          save() { echo "$FAILS" > state/fails; echo "$ALERTED" > state/alerted; echo "$SINCE" > state/since; }
           mail() {
             [ -n "${RESEND_API_KEY:-}" ] && [ -n "${ALERT_TO:-}" ] || { echo "::error::нет RESEND_API_KEY/ALERT_TO — письмо не ушло: $1"; return 1; }
             jq -n --arg to "$ALERT_TO" --arg s "$1" --arg t "$2" '{from:"AEVO Watch <noreply@aevoanimals.com>", to:[$to], subject:$s, text:$t}' > mail.json
-            C=$(curl -s -o mail.out -w '%{http_code}' --max-time 20 -X POST https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KEY" -H 'Content-Type: application/json' --data @mail.json || echo 000)
-            [ "$C" = 200 ] || { echo "::error::Resend $C: $(head -c 200 mail.out)"; return 1; }
+            C=$(curl -s -o mail.out -w '%{http_code}' --max-time 20 -X POST https://api.resend.com/emails -H "Authorization: Bearer $RESEND_API_KEY" -H 'Content-Type: application/json' --data @mail.json)
+            [ "$C" = 200 ] || { echo "::error::Resend $C: $(head -c 200 mail.out 2>/dev/null)"; return 1; }
+            echo "письмо ушло: $1"
+          }
+          # Одна проверка (две попытки через 15 с). Результат — в S, A, WHY. Пустой ответ / нет соединения = код 000, без падения.
+          check() {
+            for i in 1 2; do
+              rm -f site.html api.json
+              S=$(curl -s -o site.html -w '%{http_code}' --max-time 20 https://aevoanimals.com/); S=${S:-000}
+              A=$(curl -s -o api.json -w '%{http_code}' --max-time 20 https://aevoanimals.com/api/health); A=${A:-000}
+              WHY=""
+              if [ "$S" != 200 ] || ! grep -qi '<div id="root"\|AEVO' site.html 2>/dev/null; then WHY="сайт: $S"; fi
+              if [ "$A" != 200 ] || ! grep -q '"ok":true' api.json 2>/dev/null; then
+                BODY=$(head -c 120 api.json 2>/dev/null | tr -d '\n'); WHY="${WHY:+$WHY; }сервер /api/health: $A${BODY:+ $BODY}"
+              fi
+              [ -z "$WHY" ] && return 0
+              sleep 15
+            done
+            return 0
           }
           RC=0
-          if [ "${{ inputs.test }}" = "true" ]; then
-            mail "🧪 Пробная тревога AEVO (внешний сторож GitHub)" "Это проверка: сторож вне Яндекса работает, письма доходят. Сейчас: сайт $S, сервер /api/health $A$([ -n "$WHY" ] && echo " — есть провал: $WHY"). Настоящая тревога приходит после двух провалов подряд (≈10 минут)." || RC=1
+          if [ "$TEST" = "true" ]; then
+            check
+            mail "🧪 Пробная тревога AEVO (внешний сторож GitHub)" "Это проверка: сторож вне Яндекса работает, письма доходят. Сейчас: сайт $S, сервер /api/health $A$([ -n "$WHY" ] && echo " — есть провал: $WHY"). Настоящая тревога приходит после двух провалов подряд (≈8 минут)." || RC=1
             exit $RC
           fi
-          if [ -n "$WHY" ]; then
-            FAILS=$((FAILS+1)); [ "$SINCE" = 0 ] && SINCE=$NOW
-            echo "провал $FAILS подряд: $WHY"
-            if [ "$FAILS" -ge 2 ] && [ "$ALERTED" = 0 ]; then
-              if mail "🔴 AEVO недоступен (внешний сторож GitHub)" "Два раза подряд (≈10 минут) не отвечает: $WHY. Время (UTC): $(date -u '+%d.%m %H:%M'). Проверка вне Яндекса — если лежит облако, сторож-функция Яндекса может молчать."; then ALERTED=1; else RC=1; fi
+          END=$(( $(date -u +%s) + MINUTES * 60 ))
+          while :; do
+            check; NOW=$(date -u +%s)
+            if [ -n "$WHY" ]; then
+              FAILS=$((FAILS+1)); [ "$SINCE" = 0 ] && SINCE=$NOW
+              echo "$(date -u '+%H:%M') провал $FAILS подряд: $WHY"
+              if [ "$FAILS" -ge 2 ] && [ "$ALERTED" = 0 ]; then
+                if mail "🔴 AEVO недоступен (внешний сторож GitHub)" "Два раза подряд (≈8 минут) не отвечает: $WHY. Время (UTC): $(date -u '+%d.%m %H:%M'). Проверка вне Яндекса — если лежит облако, сторож-функция Яндекса может молчать."; then ALERTED=1; else RC=1; fi
+              fi
+            else
+              if [ "$ALERTED" = 1 ]; then mail "🟢 AEVO снова отвечает" "Сайт и сервер отвечают. Лежал примерно $(( (NOW-SINCE)/60 )) мин (по проверкам раз в 4 минуты)." || RC=1; fi
+              echo "$(date -u '+%H:%M') ок"; FAILS=0; ALERTED=0; SINCE=0
             fi
-          else
-            if [ "$ALERTED" = 1 ]; then mail "🟢 AEVO снова отвечает" "Сайт и сервер отвечают. Лежал примерно $(( (NOW-SINCE)/60 )) мин (по проверкам раз в 5 минут)." || RC=1; fi
-            echo "ок"; FAILS=0; ALERTED=0; SINCE=0
-          fi
-          echo "$FAILS" > state/fails; echo "$ALERTED" > state/alerted; echo "$SINCE" > state/since
+            save
+            [ $(( NOW + 240 )) -ge "$END" ] && break
+            sleep 240
+          done
           exit $RC
+      - name: Не дать GitHub усыпить расписание (60 дней без событий в репозитории)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Раз в сутки «включить» этот же workflow: расписание не засыпает. Запуск длится часы, поэтому по дате, а не по минуте.
+          D=$(date -u +%Y%m%d); [ "$(cat state/enabled 2>/dev/null)" = "$D" ] && exit 0
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime-watch.yml/enable" && echo "$D" > state/enabled || true
       - name: Сохранить состояние
         if: always()
         uses: actions/cache/save@v4
         with:
           path: state
           key: uptime-state-${{ github.run_id }}
-      - name: Не дать GitHub усыпить расписание (60 дней без событий в репозитории)
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Раз в сутки (первый запуск после 03:00 UTC) — «включить» этот же workflow: расписание не засыпает.
-          [ "$(date -u +%H%M)" \< "0305" ] && [ "$(date -u +%H)" = "03" ] && gh api -X PUT "repos/${{ github.repository }}/actions/workflows/uptime-watch.yml/enable" || true
